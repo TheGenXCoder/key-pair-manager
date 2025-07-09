@@ -36,7 +36,7 @@ key-pair-manager list
 
 ### Automatic Installation
 ```bash
-git clone <this-repo>
+git clone https://github.com/TheGenXCoder/key-pair-manager.git
 cd key-pair-manager
 ./install.sh
 ```
