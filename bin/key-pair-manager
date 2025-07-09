@@ -1,0 +1,308 @@
+#!/bin/bash
+
+# Key Pair Helper
+# Manages passphrases/secrets for any key pair using macOS Keychain (primary) and pass (fallback)
+
+KEY_PREFIX="keypair-"
+KEYCHAIN_SERVICE="key-pairs"
+
+# Function to detect the platform
+detect_platform() {
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        echo "macos"
+    elif [[ -f /etc/arch-release ]]; then
+        echo "arch"
+    elif [[ -f /etc/debian_version ]]; then
+        echo "debian"
+    else
+        echo "unknown"
+    fi
+}
+
+# Function to get secret from keychain (macOS)
+get_secret_keychain() {
+    local key_name="$1"
+    security find-generic-password -s "${KEYCHAIN_SERVICE}" -a "${key_name}" -w 2>/dev/null
+}
+
+# Function to store secret in keychain (macOS)
+store_secret_keychain() {
+    local key_name="$1"
+    local secret="$2"
+    security add-generic-password -s "${KEYCHAIN_SERVICE}" -a "${key_name}" -w "${secret}" -U
+}
+
+# Function to get secret from pass
+get_secret_pass() {
+    local key_name="$1"
+    pass show "${KEY_PREFIX}${key_name}" 2>/dev/null
+}
+
+# Function to store secret in pass
+store_secret_pass() {
+    local key_name="$1"
+    local secret="$2"
+    echo "${secret}" | pass insert -e "${KEY_PREFIX}${key_name}"
+}
+
+# Function to get secret (tries both methods)
+get_secret() {
+    local key_name="$1"
+    local platform=$(detect_platform)
+    local secret=""
+    
+    # Try keychain first on macOS
+    if [[ "$platform" == "macos" ]]; then
+        secret=$(get_secret_keychain "$key_name")
+    fi
+    
+    # Try pass as fallback or primary on non-macOS
+    if [[ -z "$secret" ]] && command -v pass >/dev/null 2>&1; then
+        secret=$(get_secret_pass "$key_name")
+    fi
+    
+    echo "$secret"
+}
+
+# Function to store secret (tries both methods)
+store_secret() {
+    local key_name="$1"
+    local secret="$2"
+    local platform=$(detect_platform)
+    
+    # Store in keychain on macOS
+    if [[ "$platform" == "macos" ]]; then
+        store_secret_keychain "$key_name" "$secret"
+        echo "Stored secret for $key_name in macOS Keychain"
+    fi
+    
+    # Store in pass if available
+    if command -v pass >/dev/null 2>&1; then
+        store_secret_pass "$key_name" "$secret"
+        echo "Stored secret for $key_name in pass"
+    fi
+}
+
+# Function to list all stored secrets
+list_secrets() {
+    local platform=$(detect_platform)
+    
+    echo "Stored secrets:"
+    
+    # List from keychain on macOS
+    if [[ "$platform" == "macos" ]]; then
+        echo "  From macOS Keychain:"
+        security dump-keychain | grep -A 1 "srvr.*${KEYCHAIN_SERVICE}" | grep "acct" | sed 's/.*"\(.*\)".*/    \1/' 2>/dev/null || echo "    None found"
+    fi
+    
+    # List from pass
+    if command -v pass >/dev/null 2>&1; then
+        echo "  From pass:"
+        pass ls "${KEY_PREFIX}" 2>/dev/null | grep -v "Password Store" | sed 's/.*├── /    /' | sed 's/.*└── /    /' || echo "    None found"
+    fi
+}
+
+# Function to detect SSH key type
+detect_ssh_key() {
+    local key_path="$1"
+    if [[ -f "$key_path" ]]; then
+        head -n 1 "$key_path" | grep -q "BEGIN.*PRIVATE KEY"
+    else
+        return 1
+    fi
+}
+
+# Function to detect GPG key
+detect_gpg_key() {
+    local key_path="$1"
+    if [[ -f "$key_path" ]]; then
+        head -n 1 "$key_path" | grep -q "BEGIN PGP PRIVATE KEY"
+    else
+        return 1
+    fi
+}
+
+# Function to detect certificate/key files
+detect_cert_key() {
+    local key_path="$1"
+    if [[ -f "$key_path" ]]; then
+        head -n 1 "$key_path" | grep -q "BEGIN.*CERTIFICATE\|BEGIN.*KEY"
+    else
+        return 1
+    fi
+}
+
+# Function to add SSH key with automatic passphrase retrieval
+add_ssh_key() {
+    local key_path="$1"
+    local key_name=$(basename "$key_path")
+    local passphrase=$(get_secret "$key_name")
+    
+    if [[ -n "$passphrase" ]]; then
+        # Use expect to handle passphrase input
+        expect -c "
+            spawn ssh-add \"$key_path\"
+            expect \"Enter passphrase\"
+            send \"$passphrase\r\"
+            expect eof
+        " 2>/dev/null
+        
+        if [[ $? -eq 0 ]]; then
+            echo "Successfully added SSH key $key_name to ssh-agent"
+            return 0
+        else
+            echo "Failed to add SSH key $key_name with stored passphrase"
+            return 1
+        fi
+    else
+        echo "No stored passphrase found for SSH key $key_name"
+        return 1
+    fi
+}
+
+# Function to handle GPG keys
+add_gpg_key() {
+    local key_path="$1"
+    local key_name=$(basename "$key_path")
+    local passphrase=$(get_secret "$key_name")
+    
+    if [[ -n "$passphrase" ]]; then
+        # Import GPG key (you might want to customize this)
+        gpg --batch --yes --passphrase "$passphrase" --import "$key_path" 2>/dev/null
+        if [[ $? -eq 0 ]]; then
+            echo "Successfully imported GPG key $key_name"
+            return 0
+        else
+            echo "Failed to import GPG key $key_name"
+            return 1
+        fi
+    else
+        echo "No stored passphrase found for GPG key $key_name"
+        return 1
+    fi
+}
+
+# Function to handle any key pair
+handle_key_pair() {
+    local key_path="$1"
+    local key_name=$(basename "$key_path")
+    local key_type=""
+    
+    # Detect key type
+    if detect_ssh_key "$key_path"; then
+        key_type="ssh"
+        add_ssh_key "$key_path"
+    elif detect_gpg_key "$key_path"; then
+        key_type="gpg"
+        add_gpg_key "$key_path"
+    elif detect_cert_key "$key_path"; then
+        key_type="cert"
+        echo "Certificate/key file detected: $key_name (manual handling required)"
+        return 1
+    else
+        echo "Unknown key type for $key_name"
+        return 1
+    fi
+}
+
+# Function to add all key pairs from a directory
+add_all_from_directory() {
+    local directory="$1"
+    local keys_added=0
+    local keys_failed=0
+    
+    [[ -z "$directory" ]] && directory="$HOME/.ssh"
+    
+    echo "Processing keys from: $directory"
+    
+    for key in "$directory"/*; do
+        if [[ -f "$key" && ! "$key" =~ \.(pub|old)$ && "$key" != *"known_hosts"* && "$key" != *"config"* && "$key" != *"agent.env"* && "$key" != *"pbcopy"* ]]; then
+            if handle_key_pair "$key"; then
+                ((keys_added++))
+            else
+                ((keys_failed++))
+            fi
+        fi
+    done
+    
+    echo "Results: $keys_added added, $keys_failed failed"
+}
+
+# Function to add all SSH keys specifically
+add_all_ssh_keys() {
+    add_all_from_directory "$HOME/.ssh"
+}
+
+# Function to export secret as environment variable
+export_secret() {
+    local key_name="$1"
+    local var_name="$2"
+    local secret=$(get_secret "$key_name")
+    
+    if [[ -n "$secret" ]]; then
+        export "$var_name"="$secret"
+        echo "Exported $key_name as $var_name"
+    else
+        echo "No secret found for $key_name"
+        return 1
+    fi
+}
+
+# Main command handling
+case "$1" in
+    "add")
+        if [[ -z "$2" ]]; then
+            echo "Usage: $0 add <key_path>"
+            exit 1
+        fi
+        handle_key_pair "$2"
+        ;;
+    "add-all")
+        add_all_ssh_keys
+        ;;
+    "add-from")
+        if [[ -z "$2" ]]; then
+            echo "Usage: $0 add-from <directory>"
+            exit 1
+        fi
+        add_all_from_directory "$2"
+        ;;
+    "store")
+        if [[ -z "$2" ]]; then
+            echo "Usage: $0 store <key_name>"
+            exit 1
+        fi
+        echo -n "Enter secret for $2: "
+        read -s secret
+        echo
+        store_secret "$2" "$secret"
+        ;;
+    "get")
+        if [[ -z "$2" ]]; then
+            echo "Usage: $0 get <key_name>"
+            exit 1
+        fi
+        get_secret "$2"
+        ;;
+    "export")
+        if [[ -z "$2" || -z "$3" ]]; then
+            echo "Usage: $0 export <key_name> <env_var_name>"
+            exit 1
+        fi
+        export_secret "$2" "$3"
+        ;;
+    "list")
+        list_secrets
+        ;;
+    *)
+        echo "Usage: $0 {add|add-all|add-from|store|get|export|list} [args...]"
+        echo "  add <key_path>           - Add specific key pair"
+        echo "  add-all                  - Add all SSH keys from ~/.ssh"
+        echo "  add-from <directory>     - Add all keys from specified directory"
+        echo "  store <key_name>         - Store secret for key"
+        echo "  get <key_name>           - Retrieve secret for key"
+        echo "  export <key_name> <var>  - Export secret as environment variable"
+        echo "  list                     - List all stored secrets"
+        exit 1
+        ;;
+esac
